@@ -1,163 +1,112 @@
-import os
 import io
-import base64
-import json
 
 import streamlit as st
-from dotenv import load_dotenv
 from PIL import Image
 
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.messages import HumanMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
+from llm_utils import generate_recipes
+from vision_utils import extract_ingredients_from_image_with_gemini
 
 
-# 1) .env dosyasını yükle
-load_dotenv()
-
-
-# 2) Gemini modelini hazırlayan fonksiyon
-def build_llm():
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "GOOGLE_API_KEY bulunamadı. .env dosyandaki değeri kontrol et."
-        )
-
-    # gemini-2.5-flash hem metin hem görseli destekliyor
-    llm = ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",
-        temperature=0.7,
-    )
-    return llm
-
-
-# 3) FOTOĞRAFTAN MALZEME ÇEKEN FONKSİYON (GEMINI VISION)
-def extract_ingredients_from_image_with_gemini(uploaded_file):
-    """
-    Streamlit UploadedFile alır, Gemini'ye gönderip
-    fotoğraftaki malzemeleri liste halinde döndürür.
-    """
-    llm = build_llm()
-
-    # UploadedFile -> raw bytes
-    image_bytes = uploaded_file.getvalue()
-    encoded_image = base64.b64encode(image_bytes).decode("utf-8")
-
-    # Gemini'ye text + image birlikte gönderiyoruz
-    message = HumanMessage(
-        content=[
-            {
-                "type": "text",
-                "text": """
-Bu bir mutfak fotoğrafı.
-Bu fotoğraftaki YENİLEBİLİR gıda malzemelerini listele.
-
-Kurallar:
-- Sadece açıkça görünen gıda malzemelerini yaz (domates, biber, soğan, patates, yumurta, süt vb.).
-- Her satırda SADECE malzeme adı olsun.
-- Türkçe ve küçük harfle yaz.
-- Açıklama yazma, sadece liste.
-
-Örnek çıktı:
-domates
-biber
-soğan
-""",
-            },
-            {
-                "type": "image_url",
-                "image_url": f"data:image/jpeg;base64,{encoded_image}",
-            },
-        ]
+def render_header():
+    """Sayfanın üstündeki basit header bar."""
+    st.markdown(
+        """
+        <style>
+        .mfk-header {
+            border-radius: 12px;
+            padding: 0.75rem 1rem;
+            margin-bottom: 1rem;
+            border: 1px solid rgba(148,163,184,0.6);
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+        .mfk-header-icon {
+            font-size: 2rem;
+        }
+        .mfk-header-title {
+            font-weight: 600;
+            font-size: 1.1rem;
+        }
+        .mfk-header-subtitle {
+            font-size: 0.9rem;
+            opacity: 0.8;
+        }
+        </style>
+        <div class="mfk-header">
+          <div class="mfk-header-icon">🍳</div>
+          <div>
+            <div class="mfk-header-title">Mutfak Bilgini</div>
+            <div class="mfk-header-subtitle">
+              Elindeki malzemelerle veya fotoğrafla Türk yemekleri keşfet.
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
 
-    response = llm.invoke([message])
-    raw = getattr(response, "text", None) or response.content
 
-    # Gelen metni satır satır temizleyip liste haline getirelim
-    lines = [line.strip() for line in raw.splitlines() if line.strip()]
-    ingredients = []
-    for ln in lines:
-        # başındaki "-" vs. temizle
-        ln = ln.lstrip("-•*0123456789. ").strip().lower()
-        if ln and ln not in ingredients:
-            ingredients.append(ln)
+def render_recipe_card(recipe, default_servings, meal_type_filter, diet_filter):
+    """Tarif detayını tek bir yerde çizmek için yardımcı fonksiyon."""
+    name = recipe.get("name", "İsimsiz Tarif")
+    r_servings = recipe.get("servings", default_servings)
+    time_minutes = recipe.get("time_minutes", "?")
+    difficulty = recipe.get("difficulty", "?")
+    r_meal_type = recipe.get(
+        "meal_type",
+        meal_type_filter if meal_type_filter not in ("", "Farketmez") else "",
+    )
+    r_diet = recipe.get(
+        "diet",
+        diet_filter if diet_filter not in ("", "Yok") else "",
+    )
 
-    return ingredients, raw
+    # Kartın dış çerçevesi: sadece border + padding, renkleri temaya bırakıyoruz
+    st.markdown(
+        """
+        <div style="
+            border: 1px solid rgba(148,163,184,0.6);
+            border-radius: 10px;
+            padding: 0.9rem 1rem;
+            margin: 0.6rem 0 1rem 0;
+        ">
+        """,
+        unsafe_allow_html=True,
+    )
 
+    st.markdown(f"### 🍽️ {name}")
 
-# 4) LLM JSON'unu güvenli parse eden yardımcı fonksiyon
-def parse_llm_json(raw: str):
-    """
-    LLM bazen cevabı ```json ... ``` kod bloğu içinde döndüğü için
-    bu fonksiyon önce sadece { ... } kısmını çıkarır, sonra json.loads yapar.
-    """
-    text = raw.strip()
+    info_line = f"👥 {r_servings} kişilik | ⏱️ {time_minutes} dk"
+    if difficulty:
+        info_line += f" | Zorluk: **{difficulty}**"
+    if r_meal_type:
+        info_line += f" | Tür: {r_meal_type}"
+    if r_diet:
+        info_line += f" | Diyet: {r_diet}"
 
-    # Kod bloğu varsa (```json ... ```) içinden al
-    if "```" in text:
-        parts = text.split("```")
-        # İçinde { ve } olan ilk bloğu seç
-        for part in parts:
-            if "{" in part and "}" in part:
-                text = part
-                break
+    st.write(info_line)
 
-    # İlk '{' ve son '}' arasını al
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        text = text[start : end + 1]
+    st.markdown("---")
 
-    # Artık sadece JSON kalmış olmalı
-    return json.loads(text)
+    st.markdown("**🧺 Elimizde olan malzemeler:**")
+    have = recipe.get("ingredients_have", [])
+    st.write(", ".join(have) if have else "-")
 
+    st.markdown("**🧾 Eksik malzemeler:**")
+    missing = recipe.get("ingredients_missing", [])
+    st.write(", ".join(missing) if missing else "-")
 
-# 5) TARİF ÜRETME PROMPT'U (JSON İSTİYORUZ, EN AZ 3 TARİF)
-prompt = ChatPromptTemplate.from_template(
-    """
-Sen Türk mutfağı konusunda uzman bir aşçısın.
+    st.markdown("**👩‍🍳 Yapılış adımları:**")
+    steps = recipe.get("steps", [])
+    if steps:
+        for i, step in enumerate(steps, start=1):
+            st.markdown(f"{i}. {step}")
+    else:
+        st.write("-")
 
-Elimde şu malzemeler var:
-{ingredients}
-
-Kısıtlar:
-{extra_constraints}
-
-Varsayılan kişi sayısı: {servings} kişilik.
-
-EN AZ 3 ve mümkünse 4–5 FARKLI yemek öner.
-
-Cevabı AŞAĞIDAKİ JSON formatında ver.
-Ekstra açıklama yazma, sadece GEÇERLİ bir JSON ver.
-
-Beklenen JSON şeması:
-
-{{
-  "recipes": [
-    {{
-      "name": "yemek adı",
-      "servings": 2,
-      "time_minutes": 30,
-      "difficulty": "kolay",
-      "meal_type": "ana yemek",
-      "diet": "vegan",
-      "ingredients_have": ["malzeme1", "malzeme2"],
-      "ingredients_missing": ["eksik1", "eksik2"],
-      "steps": ["adım1", "adım2", "adım3"]
-    }}
-  ],
-  "shopping_list": ["eksik1", "eksik2"]
-}}
-
-Kurallar:
-- JSON dışında hiçbir şey yazma.
-- Tek bir JSON objesi döndür.
-- "recipes" listesinde EN AZ 3 tarif olsun.
-- Tüm alanları doldurmaya çalış.
-"""
-)
+    # Kart kapatma
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def main():
@@ -171,10 +120,8 @@ def main():
     if "last_shopping_list" not in st.session_state:
         st.session_state["last_shopping_list"] = []
 
-    st.title("🍳 Mutfak Bilgini")
-    st.write(
-        "Elindeki malzemeleri yaz veya fotoğraf yükle, sana Türk mutfağından tarifler önereyim (Gemini metin + görsel)."
-    )
+    # Üst header bar
+    render_header()
 
     # --- Yan panel: ayarlar + filtreler ---
     with st.sidebar:
@@ -215,189 +162,128 @@ def main():
 
     extra_constraints = "\n".join(constraints) if constraints else "Özel bir kısıt yok."
 
-    # --- 1) Fotoğraf yükleme ---
-    st.subheader("1️⃣ İstersen fotoğraf yükle (opsiyonel)")
-    uploaded_file = st.file_uploader(
-        "Mutfak tezgahının veya malzemelerin fotoğrafını yükle",
-        type=["jpg", "jpeg", "png"],
-    )
+    # --- Sekmeler ---
+    tab_search, tab_favs = st.tabs(["🔍 Tarif Bul", "⭐ Favorilerim"])
 
-    if uploaded_file is not None:
-        # UploadedFile'dan image oluşturmak için bytes kullanıyoruz
-        image = Image.open(io.BytesIO(uploaded_file.getvalue())).convert("RGB")
-        st.image(image, caption="Yüklenen fotoğraf", use_column_width=True)
+    # ===== TAB 1: TARİF BUL =====
+    with tab_search:
+        # 1) Fotoğraf yükleme
+        st.subheader("1️⃣ İstersen fotoğraf yükle (opsiyonel)")
+        uploaded_file = st.file_uploader(
+            "Mutfak tezgahının veya malzemelerin fotoğrafını yükle",
+            type=["jpg", "jpeg", "png"],
+            key="file_uploader",
+        )
 
-        if st.button("Fotoğraftan malzemeleri çıkar (Gemini)"):
-            with st.spinner("Gemini fotoğrafı analiz ediyor..."):
-                ingredients, raw_text = extract_ingredients_from_image_with_gemini(
-                    uploaded_file
-                )
+        if uploaded_file is not None:
+            image = Image.open(io.BytesIO(uploaded_file.getvalue())).convert("RGB")
+            st.image(image, caption="Yüklenen fotoğraf", use_column_width=True)
 
-            if not ingredients:
-                st.warning(
-                    "Gemini bu fotoğrafta net malzemeler bulamadı. "
-                    "Farklı bir açı/ışıkla tekrar deneyebilir veya malzemeleri elle yazabilirsin."
-                )
-            else:
-                readable = ", ".join(ingredients)
-                st.success(f"Bulunan malzemeler: {readable}")
+            if st.button("📸 Fotoğraftan malzemeleri çıkar (Gemini)", key="extract_btn"):
+                with st.spinner("Gemini fotoğrafı analiz ediyor..."):
+                    ingredients, _ = extract_ingredients_from_image_with_gemini(
+                        uploaded_file
+                    )
 
-                # Metin kutusuna otomatik doldur
-                existing = st.session_state.get("ingredients_input", "").strip()
-                if existing:
-                    st.session_state["ingredients_input"] = existing + ", " + readable
+                if not ingredients:
+                    st.warning(
+                        "Gemini bu fotoğrafta net malzemeler bulamadı. "
+                        "Farklı bir açı/ışıkla tekrar deneyebilir veya malzemeleri elle yazabilirsin."
+                    )
                 else:
-                    st.session_state["ingredients_input"] = readable
+                    readable = ", ".join(ingredients)
+                    st.success(f"Bulunan malzemeler: {readable}")
 
-    st.markdown("---")
+                    existing = st.session_state.get("ingredients_input", "").strip()
+                    if existing:
+                        st.session_state["ingredients_input"] = (
+                            existing + ", " + readable
+                        )
+                    else:
+                        st.session_state["ingredients_input"] = readable
 
-    # --- 2) Metin ile malzeme girişi / düzenleme ---
-    st.subheader("2️⃣ Elindeki malzemeleri yaz veya düzenle")
-    st.write("Örnek: `domates, kıyma, soğan, pirinç, salça`")
+        st.markdown("---")
 
-    ingredients_input = st.text_area(
-        label="Malzemeler",
-        height=120,
-        placeholder="Elindeki malzemeleri virgülle ayırarak yaz...",
-        key="ingredients_input",  # fotoğraftan otomatik doldurmak için önemli
-    )
+        # 2) Metin ile malzeme girişi / düzenleme
+        st.subheader("2️⃣ Elindeki malzemeleri yaz veya düzenle")
+        st.write("Örnek: `domates, kıyma, soğan, pirinç, salça`")
 
-    # --- 3) LLM'den tarif isteme (sadece state'i güncelliyor) ---
-    if st.button("Tarif öner 🧠"):
-        if not ingredients_input.strip():
-            st.warning("Lütfen en az bir malzeme gir.")
-        else:
-            try:
-                llm = build_llm()
-            except Exception as e:
-                st.error(f"LLM başlatılırken hata oluştu: {e}")
-                st.info(
-                    ".env dosyandaki GOOGLE_API_KEY satırını ve Gemini anahtarını kontrol et."
-                )
+        ingredients_input = st.text_area(
+            label="Malzemeler",
+            height=120,
+            placeholder="Elindeki malzemeleri virgülle ayırarak yaz...",
+            key="ingredients_input",
+        )
+
+        # 3) LLM'den tarif isteme (state güncelleme)
+        if st.button("🧠 Tarif öner", key="generate_btn"):
+            if not ingredients_input.strip():
+                st.warning("Lütfen en az bir malzeme gir.")
             else:
-                chain = prompt | llm
-
                 with st.spinner("Gemini tarifleri hazırlıyor..."):
                     try:
-                        response = chain.invoke(
-                            {
-                                "ingredients": ingredients_input,
-                                "servings": servings,
-                                "extra_constraints": extra_constraints,
-                            }
+                        recipes, shopping_list, _ = generate_recipes(
+                            ingredients=ingredients_input,
+                            servings=servings,
+                            extra_constraints=extra_constraints,
                         )
-                        raw = getattr(response, "text", None) or response.content
-
-                        # JSON'a güvenli şekilde çevirmeyi dene
-                        try:
-                            data = parse_llm_json(raw)
-                        except Exception:
-                            st.error(
-                                "Model beklenen JSON formatında cevap vermedi. Ham çıktıyı gösteriyorum:"
-                            )
-                            st.markdown(raw)
-                        else:
-                            recipes = data.get("recipes", [])
-                            shopping_list = data.get("shopping_list", [])
-
-                            if not recipes:
-                                st.warning(
-                                    "Herhangi bir tarif bulunamadı. Malzeme listenizi veya filtreleri biraz değiştirmeyi deneyin."
-                                )
-                            else:
-                                # SONUÇLARI STATE'E KAYDET
-                                st.session_state["last_recipes"] = recipes
-                                st.session_state["last_shopping_list"] = shopping_list
                     except Exception as e:
-                        st.error(f"Bir hata oluştu: {e}")
-                        st.info(
-                            "İnternet bağlantını ve Gemini API kotanı kontrol et. Sorun devam ederse hata mesajını bana gönder."
-                        )
+                        st.error(f"Tarif üretilirken hata oluştu: {e}")
+                    else:
+                        if not recipes:
+                            st.warning(
+                                "Herhangi bir tarif bulunamadı. Malzeme listenizi veya filtreleri biraz değiştirmeyi deneyin."
+                            )
+                        else:
+                            st.session_state["last_recipes"] = recipes
+                            st.session_state["last_shopping_list"] = shopping_list
 
-    # --- 3B) STATE'TEKİ TARİFLERİ HER ZAMAN GÖSTER ---
-    recipes = st.session_state["last_recipes"]
-    shopping_list = st.session_state["last_shopping_list"]
+        # 3B) STATE'TEKİ TARİFLERİ GÖSTER
+        recipes = st.session_state["last_recipes"]
+        shopping_list = st.session_state["last_shopping_list"]
 
-    if recipes:
-        st.subheader("3️⃣ Önerilen tarifler")
+        if recipes:
+            st.subheader("3️⃣ Önerilen tarifler")
 
-        for idx, r in enumerate(recipes):
-            name = r.get("name", "İsimsiz Tarif")
-            r_servings = r.get("servings", servings)
-            time_minutes = r.get("time_minutes", "?")
-            difficulty = r.get("difficulty", "?")
-            r_meal_type = r.get(
-                "meal_type",
-                meal_type if meal_type != "Farketmez" else "",
-            )
-            r_diet = r.get("diet", diet if diet != "Yok" else "")
+            for idx, r in enumerate(recipes):
+                render_recipe_card(r, servings, meal_type, diet)
 
-            # Kart başlığı
-            st.markdown(f"### 🍽️ {name}")
+                # Favorilere ekle butonu
+                if st.button(
+                    "⭐ Bu tarifi favorilere ekle",
+                    key=f"fav_btn_{idx}",
+                ):
+                    names_in_favs = [
+                        f.get("name") for f in st.session_state["favorites"]
+                    ]
+                    if r.get("name") not in names_in_favs:
+                        st.session_state["favorites"].append(r)
+                        st.success("Tarif favorilere eklendi.")
+                    else:
+                        st.info("Bu tarif zaten favorilerinde yer alıyor.")
 
-            # Bilgi satırı
-            info_line = f"👥 {r_servings} kişilik | ⏱️ {time_minutes} dk"
-            if difficulty:
-                info_line += f" | Zorluk: **{difficulty}**"
-            if r_meal_type:
-                info_line += f" | Tür: {r_meal_type}"
-            if r_diet:
-                info_line += f" | Diyet: {r_diet}"
+            if shopping_list:
+                st.subheader("🛒 Alışveriş listesi")
+                st.write(", ".join(shopping_list))
 
-            st.write(info_line)
+    # ===== TAB 2: FAVORİLER =====
+    with tab_favs:
+        st.subheader("⭐ Favori tariflerin")
 
-            # Malzemeler
-            st.markdown("**Elimizde olan malzemeler:**")
-            have = r.get("ingredients_have", [])
-            st.write(", ".join(have) if have else "-")
+        if not st.session_state["favorites"]:
+            st.write("Henüz favoriye eklenmiş bir tarif yok.")
+        else:
+            for idx, fav in enumerate(st.session_state["favorites"]):
+                render_recipe_card(fav, fav.get("servings", 2), "", "")
 
-            st.markdown("**Eksik malzemeler:**")
-            missing = r.get("ingredients_missing", [])
-            st.write(", ".join(missing) if missing else "-")
-
-            # Adımlar
-            st.markdown("**Yapılış adımları:**")
-            steps = r.get("steps", [])
-            if steps:
-                for i, step in enumerate(steps, start=1):
-                    st.markdown(f"{i}. {step}")
-            else:
-                st.write("-")
-
-            # Favorilere ekle butonu
-            if st.button(
-                "⭐ Bu tarifi favorilere ekle",
-                key=f"fav_btn_{idx}",
-            ):
-                names_in_favs = [
-                    f.get("name") for f in st.session_state["favorites"]
-                ]
-                if r.get("name") not in names_in_favs:
-                    st.session_state["favorites"].append(r)
-                    st.success("Tarif favorilere eklendi.")
-                else:
-                    st.info("Bu tarif zaten favorilerinde yer alıyor.")
-
-            st.markdown("---")
-
-        # Alışveriş listesi
-        if shopping_list:
-            st.subheader("🛒 Alışveriş listesi")
-            st.write(", ".join(shopping_list))
-
-    # --- 4) Favori tarifler bölümü ---
-    st.subheader("⭐ Favori tariflerin")
-    if not st.session_state["favorites"]:
-        st.write("Henüz favoriye eklenmiş bir tarif yok.")
-    else:
-        for fav in st.session_state["favorites"]:
-            st.markdown(f"#### 🍽️ {fav.get('name', 'İsimsiz Tarif')}")
-            info_line = (
-                f"👥 {fav.get('servings', '?')} kişilik | "
-                f"⏱️ {fav.get('time_minutes', '?')} dk"
-            )
-            st.write(info_line)
-        st.markdown("---")
+                # Favoriden sil butonu
+                if st.button(
+                    "🗑️ Bu tarifi favorilerden sil",
+                    key=f"del_fav_{idx}",
+                ):
+                    st.session_state["favorites"].pop(idx)
+                    st.success("Tarif favorilerden silindi.")
+                    st.rerun()
 
 
 if __name__ == "__main__":
